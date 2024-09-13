@@ -46,6 +46,7 @@ struct lo_inode {
 	struct lo_inode *next; /* protected by lo->mutex */
 	struct lo_inode *prev; /* protected by lo->mutex */
 	int fd;
+	int backing_id;
 	dev_t dev;
 	uint64_t refcount; /* protected by lo->mutex */
 	struct fuse_attr attr;
@@ -75,6 +76,7 @@ struct lo_config {
 	int uring;
 	int queue_depth;
 	size_t req_size;
+	int passthrough;
 };
 
 struct lo_data {
@@ -498,6 +500,27 @@ out_err:
 	lo_reply(req, saverr, 0);
 }
 
+static int lo_backing_open(struct lo_data *lo, int fd)
+{
+	struct fuse_backing_map map = { .fd = fd };
+	int backing_id;
+
+	backing_id = ER(ioctl(lo->devfd, FUSE_DEV_IOC_BACKING_OPEN, &map));
+
+	if (lo->c.debug)
+		fprintf(stderr, "backing_open(%i) = %i\n", fd, backing_id);
+
+	return backing_id;
+}
+
+static void lo_backing_close(struct lo_data *lo, int backing_id)
+{
+	if (lo->c.debug)
+		fprintf(stderr, "backing_close(%i)\n", backing_id);
+
+	ER(ioctl(lo->devfd, FUSE_DEV_IOC_BACKING_CLOSE, &backing_id));
+}
+
 static void lo_open(struct lo_req *req, struct fuse_in_header *inh,
 		    struct fuse_open_in *inarg)
 {
@@ -508,6 +531,16 @@ static void lo_open(struct lo_req *req, struct fuse_in_header *inh,
 	char buf[64];
 	int fd;
 	int o_direct = lo->c.direct ? O_DIRECT : 0;
+
+	if (lo->c.passthrough) {
+		if (!inode->backing_id)
+			inode->backing_id = lo_backing_open(lo, inode->fd);
+		memset(outarg, 0, sizeof(*outarg));
+		outarg->open_flags = FOPEN_PASSTHROUGH;
+		outarg->backing_id = inode->backing_id;
+		lo_reply(req, 0, sizeof(*outarg));
+		return;
+	}
 
 	sprintf(buf, "/proc/self/fd/%i", inode->fd);
 	fd = open(buf, (inarg->flags & O_ACCMODE) | o_direct);
@@ -539,9 +572,11 @@ static void lo_release(struct lo_req *req, struct fuse_in_header *inh,
 
 	(void) inh;
 
-	close(lf->fd);
-
-	lo_free_file(req->lo, lf);
+	/* No lo_file for passthrough */
+	if (lf) {
+		close(lf->fd);
+		lo_free_file(req->lo, lf);
+	}
 	lo_reply(req, 0, 0);
 }
 
@@ -703,6 +738,9 @@ static void unref_inode(struct lo_data *lo, struct lo_inode *inode, uint64_t n)
 		prev->next = next;
 		lo_mutex_unlock(lo);
 
+		if (inode->backing_id)
+			lo_backing_close(lo, inode->backing_id);
+
 		close(inode->fd);
 		lo_free_inode(lo, inode);
 	} else {
@@ -746,12 +784,26 @@ static void lo_init(struct lo_req *req, struct fuse_in_header *inh,
 		    struct fuse_init_in *inarg)
 {
 	struct fuse_init_out *outarg = lo_out_arg(req);
+	uint64_t inflags = inarg->flags;
+	uint64_t outflags;
 
 	(void) inh;
-
 	memset(outarg, 0, sizeof(*outarg));
-	outarg->flags = inarg->flags &
-		(FUSE_PARALLEL_DIROPS | FUSE_ASYNC_READ | FUSE_ASYNC_DIO);
+
+	if (inflags & FUSE_INIT_EXT)
+		inflags |= (uint64_t) inarg->flags2 << 32;
+
+	outflags = inflags & (FUSE_PARALLEL_DIROPS | FUSE_ASYNC_READ | FUSE_ASYNC_DIO | FUSE_INIT_EXT);
+	if (req->lo->c.passthrough) {
+		if (!(inflags & FUSE_PASSTHROUGH))
+			errx(1, "passthrough mode not supported");
+		outflags |= FUSE_PASSTHROUGH;
+		outarg->max_stack_depth = 1;
+	}
+
+	outarg->flags = outflags;
+	if (outflags & FUSE_INIT_EXT)
+		outarg->flags2 = outflags >> 32;
 	outarg->major = FUSE_KERNEL_VERSION;
 	outarg->minor = FUSE_KERNEL_MINOR_VERSION;
 	outarg->max_readahead = inarg->max_readahead;
@@ -1051,6 +1103,10 @@ int main(int argc, char *argv[])
 				c.uring = 1;
 				c.queue_depth = 24;
 				c.req_size = 1048576;
+				break;
+
+			case 'p':
+				c.passthrough = 1;
 				break;
 #ifdef LO_NOTHREAD
 			case 't':
