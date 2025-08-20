@@ -77,6 +77,7 @@ struct lo_config {
 	int queue_depth;
 	size_t req_size;
 	int passthrough;
+	int passthrough2;
 };
 
 struct lo_data {
@@ -555,7 +556,16 @@ static void lo_open(struct lo_req *req, struct fuse_in_header *inh,
 	outarg->fh = (uintptr_t) lf;
 	outarg->open_flags = FOPEN_KEEP_CACHE;
 
-	lf->fd = fd;
+	if (lo->c.passthrough2) {
+		int backing_id = lo_backing_open(lo, fd);
+
+		outarg->open_flags = FOPEN_PASSTHROUGH;
+		outarg->backing_id = backing_id;
+		close(fd);
+		lf->fd = backing_id;
+	} else {
+		lf->fd = fd;
+	}
 
 	lo_reply(req, 0, sizeof(*outarg));
 }
@@ -574,7 +584,10 @@ static void lo_release(struct lo_req *req, struct fuse_in_header *inh,
 
 	/* No lo_file for passthrough */
 	if (lf) {
-		close(lf->fd);
+		if (req->lo->c.passthrough2)
+			lo_backing_close(req->lo, lf->fd);
+		else
+			close(lf->fd);
 		lo_free_file(req->lo, lf);
 	}
 	lo_reply(req, 0, 0);
@@ -794,7 +807,7 @@ static void lo_init(struct lo_req *req, struct fuse_in_header *inh,
 		inflags |= (uint64_t) inarg->flags2 << 32;
 
 	outflags = inflags & (FUSE_PARALLEL_DIROPS | FUSE_ASYNC_READ | FUSE_ASYNC_DIO | FUSE_INIT_EXT);
-	if (req->lo->c.passthrough) {
+	if (req->lo->c.passthrough || req->lo->c.passthrough2) {
 		if (!(inflags & FUSE_PASSTHROUGH))
 			errx(1, "passthrough mode not supported");
 		outflags |= FUSE_PASSTHROUGH;
@@ -1107,6 +1120,10 @@ int main(int argc, char *argv[])
 
 			case 'p':
 				c.passthrough = 1;
+				break;
+
+			case 'q':
+				c.passthrough2 = 1;
 				break;
 #ifdef LO_NOTHREAD
 			case 't':
