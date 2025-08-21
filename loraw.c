@@ -94,6 +94,7 @@ struct lo_data {
 	struct lo_config c;
 	struct lo_inode root;
 	int devfd;
+	int inited;
 };
 
 struct lo_chan {
@@ -106,8 +107,8 @@ struct lo_chan {
 struct lo_ring_req {
 	struct io_uring *ring;
 	int qid;
-	int tag;
-	struct fuse_ring_req *rreq;
+	struct fuse_uring_req_header *rreq;
+	struct iovec iov[2];
 	uint64_t unique;
 };
 
@@ -312,38 +313,42 @@ static void lo_reply_ch(struct lo_req *req, int error, size_t argsize)
 	ER(write(lc->fd, lc->outbuf, outh->len));
 }
 
-#ifdef LO_URING
 static void lo_queue_uring(struct lo_req *req, int cmd_op)
 {
 	struct io_uring_sqe *sqe;
 	struct fuse_uring_cmd_req *ureq;
 
-	req->rr.unique = 0; /* request is in waiting state */
 	sqe = NL(io_uring_get_sqe(req->rr.ring));
-	io_uring_prep_cmd_sock(sqe, cmd_op, 0, 0, 0, NULL, 0);
-	io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
-	ureq = (struct fuse_uring_cmd_req *) &sqe->cmd[0];
-	ureq->buf_ptr = (uint64_t) req->rr.rreq;
-	ureq->buf_len = req->lo->c.req_size;
+	sqe->opcode = IORING_OP_URING_CMD;
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->fd = 0;
+	sqe->rw_flags = 0;
+	sqe->ioprio = 0;
+	sqe->off = 0;
+	sqe->cmd_op = cmd_op;
+	sqe->__pad1 = 0;
+
+	ureq = (struct fuse_uring_cmd_req *) sqe->cmd;
 	ureq->qid = req->rr.qid;
-	ureq->tag = req->rr.tag;
+	ureq->commit_id = req->rr.rreq->ring_ent_in_out.commit_id;
 	ureq->flags = 0;
 	io_uring_sqe_set_data(sqe, req);
 }
 
 static void lo_reply_uring(struct lo_req *req, int error, size_t argsize)
 {
-	struct fuse_ring_req *rreq = req->rr.rreq;
+	struct fuse_uring_req_header *rreq = req->rr.rreq;
+	struct fuse_out_header *out = (struct fuse_out_header *)&rreq->in_out;
+	struct fuse_uring_ent_in_out *ent_in_out = &rreq->ring_ent_in_out;
 
-	rreq->in_out_arg_len = argsize;
-	rreq->out.len = sizeof(struct fuse_out_header) + argsize;
-	rreq->out.error = -error;
-	rreq->out.unique = req->rr.unique;
+	ent_in_out->payload_sz = argsize;
+	out->len = sizeof(struct fuse_out_header) + argsize;
+	out->error = -error;
+	out->unique = req->rr.unique;
 
-	lo_queue_uring(req, FUSE_URING_REQ_COMMIT_AND_FETCH);
+	lo_queue_uring(req, FUSE_IO_URING_CMD_COMMIT_AND_FETCH);
 	NE(io_uring_submit(req->rr.ring));
 }
-#endif
 
 static void lo_reply(struct lo_req *req, int error, size_t argsize)
 {
@@ -351,38 +356,26 @@ static void lo_reply(struct lo_req *req, int error, size_t argsize)
 		fprintf(stderr, "   error: %i, outsize: %zu\n", error,
 			sizeof(struct fuse_out_header) + argsize);
 	}
-#ifdef LO_URING
 	if (req->is_ch)
-#endif
 		lo_reply_ch(req, error, argsize);
-#ifdef LO_URING
 	else
 		lo_reply_uring(req, error, argsize);
-#endif
 }
 
 static void *lo_out_arg(struct lo_req *req)
 {
-#ifdef LO_URING
 	if (req->is_ch)
-#endif
 		return ((struct fuse_out_header *) req->ch.outbuf) + 1;
-#ifdef LO_URING
 	else
-		return req->rr.rreq->in_out_arg;
-#endif
+		return req->rr.iov[1].iov_base;
 }
 
 static bool lo_overflow(struct lo_req *req, size_t size)
 {
-#ifdef LO_URING
 	if (req->is_ch)
-#endif
 		return size > req->ch.bufsize - sizeof(struct fuse_out_header);
-#ifdef LO_URING
 	else
-		return size > req->lo->c.req_size - FUSE_RING_HEADER_BUF_SIZE;
-#endif
+		return size > req->rr.iov[1].iov_len;
 }
 
 static void lo_convert_stat(const struct statx *stat, struct fuse_attr *attr)
@@ -795,12 +788,15 @@ static void lo_forget(struct lo_data *lo, struct fuse_in_header *inh,
 }
 
 static void lo_batch_forget(struct lo_data *lo, struct fuse_in_header *inh,
-			    struct fuse_batch_forget_in *inarg)
+			    struct fuse_batch_forget_in *inarg,
+			    struct fuse_forget_one *param)
 {
-	struct fuse_forget_one *param = (void *) (inarg + 1);
 	unsigned int i;
 
 	(void) inh;
+
+	if (!param)
+		param = (void *) (inarg + 1);
 
 	for (i = 0; i < inarg->count; i++)
 		lo_forget_one(lo, param[i].nodeid, param[i].nlookup);
@@ -827,12 +823,17 @@ static void lo_init(struct lo_req *req, struct fuse_in_header *inh,
 		outarg->max_stack_depth = 1;
 	}
 
+	if (req->lo->c.uring && !(inflags & FUSE_OVER_IO_URING))
+		errx(1, "uring mode not supported");
+
 	outarg->flags = outflags;
 	if (outflags & FUSE_INIT_EXT)
 		outarg->flags2 = outflags >> 32;
 	outarg->major = FUSE_KERNEL_VERSION;
 	outarg->minor = FUSE_KERNEL_MINOR_VERSION;
 	outarg->max_readahead = inarg->max_readahead;
+
+	req->lo->inited = 1;
 
 	lo_reply(req, 0, sizeof(*outarg));
 }
@@ -848,7 +849,7 @@ static size_t lo_getreq(struct lo_chan *lc)
 }
 
 static void lo_process(struct lo_req *req, struct fuse_in_header *inh,
-		       void *arg, size_t len, struct io_uring_cqe *cqe)
+		       void *arg, void *payload, size_t len, struct io_uring_cqe *cqe)
 {
 
 	if (lo_debug(req)) {
@@ -860,47 +861,56 @@ static void lo_process(struct lo_req *req, struct fuse_in_header *inh,
 
 	switch (inh->opcode) {
 	case FUSE_INIT:
+		assert(req->is_ch || !len);
 		lo_init(req, inh, arg);
 		break;
 
 	case FUSE_LOOKUP:
-		lo_lookup(req, inh, arg);
+		lo_lookup(req, inh, payload ? payload : arg);
 		break;
 
 	case FUSE_GETATTR:
+		assert(req->is_ch || !len);
 		lo_getattr(req, inh, arg);
 		break;
 
 	case FUSE_OPEN:
+		assert(req->is_ch || !len);
 		lo_open(req, inh, arg);
 		break;
 
 	case FUSE_RELEASE:
+		assert(req->is_ch || !len);
 		lo_release(req, inh, arg);
 		break;
 
 	case FUSE_READ:
+		assert(req->is_ch || !len);
 		lo_read(req, inh, arg);
 		break;
 
 	case FUSE_OPENDIR:
+		assert(req->is_ch || !len);
 		lo_opendir(req, inh, arg);
 		break;
 
 	case FUSE_RELEASEDIR:
+		assert(req->is_ch || !len);
 		lo_releasedir(req, inh, arg);
 		break;
 
 	case FUSE_READDIR:
+		assert(req->is_ch || !len);
 		lo_readdir(req, inh, arg);
 		break;
 
 	case FUSE_FORGET:
+		assert(req->is_ch || !len);
 		lo_forget(req->lo, inh, arg);
 		break;
 
 	case FUSE_BATCH_FORGET:
-		lo_batch_forget(req->lo, inh, arg);
+		lo_batch_forget(req->lo, inh, arg, payload);
 		break;
 
 	default:
@@ -926,92 +936,82 @@ struct lo_thread_data {
 	int cpu;
 };
 
-#ifdef LO_URING
 static void lo_start_uring(struct lo_thread_data *ltd)
 {
-	int fd, tag;
+	int fd, i;
 	struct lo_data *lo = ltd->lo;
 	struct io_uring ring;
 	struct lo_req *req;
-	struct fuse_ring_queue_config queue_cfg = {
-		.qid = ltd->cpu,
-		.control_fd = lo->devfd,
-	};
 
-	fd = ER(open("/dev/fuse", O_RDWR));
-	ER(ioctl(fd, FUSE_DEV_IOC_URING_QUEUE_CFG, &queue_cfg));
+	fd = lo->devfd;
+
 	NE(io_uring_queue_init(lo->c.queue_depth, &ring, IORING_SETUP_SQE128));
 	NE(io_uring_register_files(&ring, &fd, 1));
 
-	for (tag = 0; tag < lo->c.queue_depth; tag++) {
+	for (i = 0; i < lo->c.queue_depth; i++) {
+		struct io_uring_sqe *sqe;
+		struct fuse_uring_cmd_req *ureq;
+
 		req = NL(calloc(1, sizeof(*req)));
+
 		req->lo = lo;
 		req->is_ch = 0;
 		req->rr.ring = &ring,
 		req->rr.qid = ltd->cpu;
-		req->rr.tag = tag;
 
-		PE(posix_memalign((void **) &req->rr.rreq, 0x1000, lo->c.req_size));
-		lo_queue_uring(req, FUSE_URING_REQ_FETCH);
+		/* Allocate header buffer (page-aligned) */
+		PE(posix_memalign((void **) &req->rr.rreq, 0x1000, sizeof(struct fuse_uring_req_header)));
+
+		/* Allocate payload buffer (page-aligned) */
+		req->rr.iov[1].iov_len = lo->c.req_size;
+		PE(posix_memalign((void **) &req->rr.iov[1].iov_base, 0x1000, req->rr.iov[1].iov_len));
+
+		if (lo->c.debug) {
+			fprintf(stderr, "NEW req=%p rreq=%p qid=%i\n",
+				req, req->rr.rreq, req->rr.qid);
+		}
+
+		sqe = NL(io_uring_get_sqe(&ring));
+		sqe->opcode = IORING_OP_URING_CMD;
+		sqe->flags = IOSQE_FIXED_FILE;
+		sqe->fd = 0;
+		sqe->cmd_op = FUSE_IO_URING_CMD_REGISTER;
+
+		req->rr.iov[0].iov_base = req->rr.rreq;
+		req->rr.iov[0].iov_len = sizeof(struct fuse_uring_req_header);
+		sqe->addr = (unsigned long) req->rr.iov;
+		sqe->len = 2;
+
+		ureq = (struct fuse_uring_cmd_req *) sqe->cmd;
+		ureq->qid = req->rr.qid;
+		io_uring_sqe_set_data(sqe, req);
 	}
 	NE(io_uring_submit(&ring));
 
 	for (;;) {
-		struct fuse_ring_req *rreq;
+		struct fuse_uring_req_header *rreq;
 		struct io_uring_cqe *cqe;
-		int cont = 1;
+		struct fuse_in_header *in;
+		struct fuse_uring_ent_in_out *ent_in_out;
 
 		NE(io_uring_wait_cqe(&ring, &cqe));
 
 		req = io_uring_cqe_get_data(cqe);
 		rreq = req->rr.rreq;
-		if (!req->rr.unique) {
-			req->rr.unique = rreq->in.unique;
-			cont = 0;
+		in = (struct fuse_in_header *)&rreq->in_out;
+		ent_in_out = &rreq->ring_ent_in_out;
+
+
+		if (lo->c.debug) {
+			fprintf(stderr, "CQE res=%d, commit_id=%lu, payload_sz=%u req=%p\n",
+				cqe->res, ent_in_out->commit_id, ent_in_out->payload_sz, req);
 		}
-		lo_process(req, &rreq->in, rreq->in_out_arg,
-			   sizeof(rreq->in) + rreq->in_out_arg_len,
-			   cont ? cqe : NULL);
+		assert(!cqe->res);
+		req->rr.unique = in->unique;
+		lo_process(req, in, rreq->op_in, req->rr.iov[1].iov_base, ent_in_out->payload_sz, cqe);
 		io_uring_cqe_seen(req->rr.ring, cqe);
 	}
 }
-
-static void lo_config_uring(struct lo_data *lo)
-{
-	int nr_queues = get_nprocs_conf();
-	struct fuse_ring_config rconf = {
-		.nr_queues		= nr_queues,
-		.sync_queue_depth	= lo->c.queue_depth / 3 * 2,
-		.async_queue_depth	= lo->c.queue_depth - rconf.sync_queue_depth,
-		.user_req_buf_sz	= lo->c.req_size,
-		.numa_aware		= nr_queues > 1,
-	};
-	ER(ioctl(lo->devfd, FUSE_DEV_IOC_URING_CFG, &rconf));
-}
-#endif /* LO_URING */
-
-#if 0
-static void *lo_process_init(void *data)
-{
-	struct lo_data *lo = data;
-	struct lo_req req = {
-		.lo = lo,
-		.is_ch = 1,
-		.ch.fd = lo->devfd,
-	};
-	struct fuse_in_header *inh;
-	void *arg;
-	size_t len;
-
-	lo_alloc_bufs(&req.ch);
-	inh = req.ch.inbuf;
-	arg = inh + 1;
-	len = lo_getreq(&req.ch);
-	lo_process(&req, inh, arg, len, NULL);
-
-	return NULL;
-}
-#endif
 
 static void lo_loop(struct lo_data *lo, int fd)
 {
@@ -1029,9 +1029,30 @@ static void lo_loop(struct lo_data *lo, int fd)
 		size_t len;
 
 		len = lo_getreq(&req.ch);
-		lo_process(&req, inh, arg, len, NULL);
+		lo_process(&req, inh, arg, NULL, len, NULL);
 	}
 
+}
+
+static void lo_process_init(struct lo_data *lo)
+{
+	struct lo_req req = {
+		.lo = lo,
+		.is_ch = 1,
+		.ch.fd = lo->devfd,
+	};
+	struct fuse_in_header *inh;
+	void *arg;
+	size_t len;
+
+	lo_alloc_bufs(&req.ch);
+
+	inh = req.ch.inbuf;
+	arg = inh + 1;
+	len = lo_getreq(&req.ch);
+	lo_process(&req, inh, arg, NULL, len, NULL);
+
+	assert(lo->inited);
 }
 
 static void lo_start_common(struct lo_thread_data *ltd)
@@ -1040,12 +1061,10 @@ static void lo_start_common(struct lo_thread_data *ltd)
 	int devfd = lo->devfd;
 	int fd = devfd;
 
-#ifdef LO_URING
 	if (ltd->lo->c.uring) {
 		lo_start_uring(ltd);
 		return;
 	}
-#endif
 
 	if (ltd->lo->c.bind) {
 		fd = ER(open("/dev/fuse", O_RDWR));
@@ -1152,13 +1171,11 @@ int main(int argc, char *argv[])
 			case 'r':
 				c.direct = 1;
 				break;
-#ifdef LO_URING
 			case 'u':
 				c.uring = 1;
 				c.queue_depth = 24;
 				c.req_size = 1048576;
 				break;
-#endif
 			case 'p':
 				c.passthrough = 1;
 				break;
@@ -1207,18 +1224,19 @@ int main(int argc, char *argv[])
 	snprintf(opts, sizeof(opts),
 		 "fd=%i,rootmode=40000,user_id=0,group_id=0",
 		 lo->devfd);
-#ifdef LO_URING
-	if (lo->c.uring)
-		lo_config_uring(lo);
-#endif
+
 	if (!lo->c.single) {
-		if (ioctl(lo->devfd, FUSE_DEV_IOC_SYNC_INIT) == 0)
+		if (!lo->c.uring &&
+		    ioctl(lo->devfd, FUSE_DEV_IOC_SYNC_INIT) == 0)
 			lo_start_threads(lo);
 		else
 			delay_threads = 1;
 	}
 
 	ER(mount("loraw", mnt, "fuse.loraw", 0, opts));
+
+	if (lo->c.uring)
+		lo_process_init(lo);
 
 	if (delay_threads)
 		lo_start_threads(lo);
