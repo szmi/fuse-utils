@@ -312,6 +312,7 @@ static void lo_reply_ch(struct lo_req *req, int error, size_t argsize)
 	ER(write(lc->fd, lc->outbuf, outh->len));
 }
 
+#ifdef LO_URING
 static void lo_queue_uring(struct lo_req *req, int cmd_op)
 {
 	struct io_uring_sqe *sqe;
@@ -342,6 +343,7 @@ static void lo_reply_uring(struct lo_req *req, int error, size_t argsize)
 	lo_queue_uring(req, FUSE_URING_REQ_COMMIT_AND_FETCH);
 	NE(io_uring_submit(req->rr.ring));
 }
+#endif
 
 static void lo_reply(struct lo_req *req, int error, size_t argsize)
 {
@@ -349,27 +351,38 @@ static void lo_reply(struct lo_req *req, int error, size_t argsize)
 		fprintf(stderr, "   error: %i, outsize: %zu\n", error,
 			sizeof(struct fuse_out_header) + argsize);
 	}
-
+#ifdef LO_URING
 	if (req->is_ch)
+#endif
 		lo_reply_ch(req, error, argsize);
+#ifdef LO_URING
 	else
 		lo_reply_uring(req, error, argsize);
+#endif
 }
 
 static void *lo_out_arg(struct lo_req *req)
 {
+#ifdef LO_URING
 	if (req->is_ch)
+#endif
 		return ((struct fuse_out_header *) req->ch.outbuf) + 1;
+#ifdef LO_URING
 	else
 		return req->rr.rreq->in_out_arg;
+#endif
 }
 
 static bool lo_overflow(struct lo_req *req, size_t size)
 {
+#ifdef LO_URING
 	if (req->is_ch)
+#endif
 		return size > req->ch.bufsize - sizeof(struct fuse_out_header);
+#ifdef LO_URING
 	else
 		return size > req->lo->c.req_size - FUSE_RING_HEADER_BUF_SIZE;
+#endif
 }
 
 static void lo_convert_stat(const struct statx *stat, struct fuse_attr *attr)
@@ -913,6 +926,7 @@ struct lo_thread_data {
 	int cpu;
 };
 
+#ifdef LO_URING
 static void lo_start_uring(struct lo_thread_data *ltd)
 {
 	int fd, tag;
@@ -962,6 +976,43 @@ static void lo_start_uring(struct lo_thread_data *ltd)
 	}
 }
 
+static void lo_config_uring(struct lo_data *lo)
+{
+	int nr_queues = get_nprocs_conf();
+	struct fuse_ring_config rconf = {
+		.nr_queues		= nr_queues,
+		.sync_queue_depth	= lo->c.queue_depth / 3 * 2,
+		.async_queue_depth	= lo->c.queue_depth - rconf.sync_queue_depth,
+		.user_req_buf_sz	= lo->c.req_size,
+		.numa_aware		= nr_queues > 1,
+	};
+	ER(ioctl(lo->devfd, FUSE_DEV_IOC_URING_CFG, &rconf));
+}
+#endif /* LO_URING */
+
+#if 0
+static void *lo_process_init(void *data)
+{
+	struct lo_data *lo = data;
+	struct lo_req req = {
+		.lo = lo,
+		.is_ch = 1,
+		.ch.fd = lo->devfd,
+	};
+	struct fuse_in_header *inh;
+	void *arg;
+	size_t len;
+
+	lo_alloc_bufs(&req.ch);
+	inh = req.ch.inbuf;
+	arg = inh + 1;
+	len = lo_getreq(&req.ch);
+	lo_process(&req, inh, arg, len, NULL);
+
+	return NULL;
+}
+#endif
+
 static void lo_loop(struct lo_data *lo, int fd)
 {
 	struct lo_req req = {
@@ -989,10 +1040,12 @@ static void lo_start_common(struct lo_thread_data *ltd)
 	int devfd = lo->devfd;
 	int fd = devfd;
 
+#ifdef LO_URING
 	if (ltd->lo->c.uring) {
 		lo_start_uring(ltd);
 		return;
 	}
+#endif
 
 	if (ltd->lo->c.bind) {
 		fd = ER(open("/dev/fuse", O_RDWR));
@@ -1060,19 +1113,6 @@ static void lo_start_threads(struct lo_data *lo)
 	}
 }
 
-static void lo_config_uring(struct lo_data *lo)
-{
-	int nr_queues = get_nprocs_conf();
-	struct fuse_ring_config rconf = {
-		.nr_queues		= nr_queues,
-		.sync_queue_depth	= lo->c.queue_depth / 3 * 2,
-		.async_queue_depth	= lo->c.queue_depth - rconf.sync_queue_depth,
-		.user_req_buf_sz	= lo->c.req_size,
-		.numa_aware		= nr_queues > 1,
-	};
-	ER(ioctl(lo->devfd, FUSE_DEV_IOC_URING_CFG, &rconf));
-}
-
 static void lo_usage(char *argv[])
 {
 	errx(1, "usage: %s [-d] [-s] [-b] [-r] [-t] mountpoint", argv[0]);
@@ -1087,6 +1127,7 @@ int main(int argc, char *argv[])
 	struct statx stat;
 	int ctr;
 	const char *mnt = NULL;
+	int delay_threads = 0;
 
 	if (argc < 2)
 		lo_usage(argv);
@@ -1111,13 +1152,13 @@ int main(int argc, char *argv[])
 			case 'r':
 				c.direct = 1;
 				break;
-
+#ifdef LO_URING
 			case 'u':
 				c.uring = 1;
 				c.queue_depth = 24;
 				c.req_size = 1048576;
 				break;
-
+#endif
 			case 'p':
 				c.passthrough = 1;
 				break;
@@ -1166,13 +1207,20 @@ int main(int argc, char *argv[])
 	snprintf(opts, sizeof(opts),
 		 "fd=%i,rootmode=40000,user_id=0,group_id=0",
 		 lo->devfd);
+#ifdef LO_URING
+	if (lo->c.uring)
+		lo_config_uring(lo);
+#endif
+	if (!lo->c.single) {
+		if (ioctl(lo->devfd, FUSE_DEV_IOC_SYNC_INIT) == 0)
+			lo_start_threads(lo);
+		else
+			delay_threads = 1;
+	}
 
 	ER(mount("loraw", mnt, "fuse.loraw", 0, opts));
 
-	if (lo->c.uring)
-		lo_config_uring(lo);
-
-	if (!lo->c.single)
+	if (delay_threads)
 		lo_start_threads(lo);
 
 	lo_loop(lo, lo->devfd);
