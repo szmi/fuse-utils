@@ -78,6 +78,7 @@ struct lo_config {
 	size_t req_size;
 	int passthrough;
 	int passthrough2;
+	const char *mnt;
 };
 
 struct lo_data {
@@ -1132,6 +1133,28 @@ static void lo_start_threads(struct lo_data *lo)
 	}
 }
 
+static void lo_mount(struct lo_data *lo)
+{
+	int fs_fd, mnt_fd;
+	int ret;
+
+	fs_fd = ER(fsopen("fuse", 0));
+	ret = fsconfig(fs_fd, FSCONFIG_SET_FD, "fd", NULL, lo->devfd);
+	if (ret == -1) {
+		char opt[64];
+		snprintf(opt, sizeof(opt), "%i", lo->devfd);
+		ER(fsconfig(fs_fd, FSCONFIG_SET_STRING, "fd", opt, 0));
+	}
+	ER(fsconfig(fs_fd, FSCONFIG_SET_STRING, "rootmode", "40000", 0));
+	ER(fsconfig(fs_fd, FSCONFIG_SET_STRING, "user_id", "0", 0));
+	ER(fsconfig(fs_fd, FSCONFIG_SET_STRING, "group_id", "0", 0));
+	ER(fsconfig(fs_fd, FSCONFIG_CMD_CREATE, 0, 0, 0));
+	mnt_fd = ER(fsmount(fs_fd, 0, 0));
+	ER(move_mount(mnt_fd, "", AT_FDCWD, lo->c.mnt, MOVE_MOUNT_F_EMPTY_PATH));
+	close(mnt_fd);
+	close(fs_fd);
+}
+
 static void lo_usage(char *argv[])
 {
 	errx(1, "usage: %s [-d] [-s] [-b] [-r] [-t] mountpoint", argv[0]);
@@ -1142,10 +1165,8 @@ int main(int argc, char *argv[])
 	struct lo_data *lo;
 	struct lo_config c = {};
 	char *devname = "/dev/fuse";
-	char opts[128];
 	struct statx stat;
 	int ctr;
-	const char *mnt = NULL;
 	int delay_threads = 0;
 
 	if (argc < 2)
@@ -1192,8 +1213,8 @@ int main(int argc, char *argv[])
 				lo_usage(argv);
 			}
 
-		} else if (!mnt) {
-			mnt = arg;
+		} else if (!c.mnt) {
+			c.mnt = arg;
 		} else {
 			lo_usage(argv);
 		}
@@ -1221,10 +1242,6 @@ int main(int argc, char *argv[])
 
 	lo->devfd = ER(open(devname, O_RDWR));
 
-	snprintf(opts, sizeof(opts),
-		 "fd=%i,rootmode=40000,user_id=0,group_id=0",
-		 lo->devfd);
-
 	if (!lo->c.single) {
 		if (!lo->c.uring &&
 		    ioctl(lo->devfd, FUSE_DEV_IOC_SYNC_INIT) == 0)
@@ -1233,7 +1250,7 @@ int main(int argc, char *argv[])
 			delay_threads = 1;
 	}
 
-	ER(mount("loraw", mnt, "fuse.loraw", 0, opts));
+	lo_mount(lo);
 
 	if (lo->c.uring)
 		lo_process_init(lo);
