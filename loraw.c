@@ -78,6 +78,7 @@ struct lo_config {
 	size_t req_size;
 	int passthrough;
 	int passthrough2;
+	int fusex;
 	const char *mnt;
 };
 
@@ -400,10 +401,34 @@ static void lo_convert_stat(const struct statx *stat, struct fuse_attr *attr)
 	attr->ctimensec	= stat->stx_ctime.tv_nsec;
 }
 
+static void lo_statx(struct lo_req *req, const struct fuse_in_header *inh,
+		     const struct fuse_statx_in *inarg)
+{
+	struct lo_data *lo = req->lo;
+	struct lo_inode *inode = lo_inode(lo, inh->nodeid);
+	struct fuse_statx_out *outarg = lo_out_arg(req);
+	struct statx stat;
+	int err;
+
+	(void) inarg;
+
+	err = statx(inode->fd, "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &stat);
+	if (err) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+	assert(sizeof(outarg->stat) == sizeof(stat));
+	memcpy(&outarg->stat, &stat, sizeof(stat));
+	outarg->attr_valid = req->lo->c.timeout;
+
+	lo_reply(req, 0, sizeof(*outarg));
+}
+
 static void lo_getattr(struct lo_req *req, struct fuse_in_header *inh,
 		       struct fuse_getattr_in *inarg)
 {
 	struct lo_data *lo = req->lo;
+	struct lo_inode *inode = lo_inode(lo, inh->nodeid);
 	struct fuse_attr_out *outarg = lo_out_arg(req);
 
 	(void) inarg;
@@ -414,7 +439,7 @@ static void lo_getattr(struct lo_req *req, struct fuse_in_header *inh,
 	outarg->attr_valid = lo->c.timeout;
 	outarg->attr_valid_nsec = 0;
 	outarg->dummy = 0;
-	outarg->attr = lo_inode(lo, inh->nodeid)->attr;
+	outarg->attr = inode->attr;
 	lo_reply(req, 0, sizeof(*outarg));
 }
 
@@ -434,6 +459,86 @@ static struct lo_inode *lo_find(struct lo_data *lo, struct statx *st)
 	}
 	lo_mutex_unlock(lo);
 	return ret;
+}
+
+static void lo_reply_entry(struct lo_req *req, struct lo_inode *inode)
+{
+	struct fuse_entryx_out *outarg = lo_out_arg(req);
+
+	outarg->nodeid = (uintptr_t) inode;
+	lo_reply(req, 0, sizeof(*outarg));
+}
+
+static void lo_lookup_root(struct lo_req *req, const struct fuse_in_header *inh)
+{
+	struct lo_data *lo = req->lo;
+
+	(void) inh;
+
+	lo_reply_entry(req, &lo->root);
+}
+
+static void lo_lookupx(struct lo_req *req, const struct fuse_in_header *inh, const char *name)
+{
+	struct lo_data *lo = req->lo;
+	struct lo_inode *inode, *parent = lo_inode(lo, inh->nodeid);
+	struct fuse_entryx_out *outarg = lo_out_arg(req);
+	struct statx stat;
+	int newfd, res;
+
+	if (lo_debug(req)) {
+		fprintf(stderr, " lo_lookupx(parent=%"PRIu64", name=%s)\n",
+			inh->nodeid, name);
+	}
+
+	newfd = openat(parent->fd, name, O_PATH | O_NOFOLLOW);
+	if (newfd == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	outarg->entry_valid = lo->c.timeout;
+	res = statx(newfd, "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS,  &stat);
+	if (res == -1) {
+		if (errno != ENOENT) {
+			lo_reply(req, errno, 0);
+			close(newfd);
+			return;
+		}
+		outarg->flags = FUSE_ENTRYX_NEGATIVE;
+		lo_reply(req, 0, sizeof(*outarg));
+		return;
+	}
+
+	inode = lo_find(lo, &stat);
+	if (inode) {
+		close(newfd);
+		newfd = -1;
+	} else {
+		struct lo_inode *prev, *next;
+
+		inode = lo_alloc_inode(lo);
+		if (!inode) {
+			lo_reply(req, ENOMEM, 0);
+			close(newfd);
+			return;
+		}
+
+		inode->refcount = 1;
+		inode->fd = newfd;
+		inode->dev = makedev(stat.stx_dev_major, stat.stx_dev_minor);
+		lo_convert_stat(&stat, &inode->attr);
+
+		lo_mutex_lock(lo);
+		prev = &lo->root;
+		next = prev->next;
+		next->prev = inode;
+		inode->next = next;
+		inode->prev = prev;
+		prev->next = inode;
+		lo_mutex_unlock(lo);
+	}
+	lo_reply_entry(req, inode);
 }
 
 static void lo_lookup(struct lo_req *req, struct fuse_in_header *inh,
@@ -833,6 +938,8 @@ static void lo_init(struct lo_req *req, struct fuse_in_header *inh,
 	outarg->major = FUSE_KERNEL_VERSION;
 	outarg->minor = FUSE_KERNEL_MINOR_VERSION;
 	outarg->max_readahead = inarg->max_readahead;
+	outarg->max_write = 131072;
+	outarg->max_pages = 32;
 
 	req->lo->inited = 1;
 
@@ -866,8 +973,21 @@ static void lo_process(struct lo_req *req, struct fuse_in_header *inh,
 		lo_init(req, inh, arg);
 		break;
 
+	case FUSE_LOOKUP_ROOT:
+		lo_lookup_root(req, inh);
+		break;
+
+	case FUSE_LOOKUPX:
+		lo_lookupx(req, inh, payload ? payload : arg);
+ 		break;
+
 	case FUSE_LOOKUP:
 		lo_lookup(req, inh, payload ? payload : arg);
+		break;
+
+	case FUSE_STATX:
+		assert(req->is_ch || !len);
+		lo_statx(req, inh, arg);
 		break;
 
 	case FUSE_GETATTR:
@@ -1138,16 +1258,22 @@ static void lo_mount(struct lo_data *lo)
 	int fs_fd, mnt_fd;
 	int ret;
 
-	fs_fd = ER(fsopen("fuse", 0));
-	ret = fsconfig(fs_fd, FSCONFIG_SET_FD, "fd", NULL, lo->devfd);
-	if (ret == -1) {
-		char opt[64];
-		snprintf(opt, sizeof(opt), "%i", lo->devfd);
-		ER(fsconfig(fs_fd, FSCONFIG_SET_STRING, "fd", opt, 0));
+	if (lo->c.fusex) {
+		fs_fd = ER(fsopen("fusex", 0));
+		ER(fsconfig(fs_fd, FSCONFIG_SET_FD, "fd", NULL, lo->devfd));
+	} else {
+		fs_fd = ER(fsopen("fuse", 0));
+		ret = fsconfig(fs_fd, FSCONFIG_SET_FD, "fd", NULL, lo->devfd);
+		if (ret == -1) {
+			char opt[64];
+			snprintf(opt, sizeof(opt), "%i", lo->devfd);
+			ER(fsconfig(fs_fd, FSCONFIG_SET_STRING, "fd", opt, 0));
+		}
+		ER(fsconfig(fs_fd, FSCONFIG_SET_STRING, "rootmode", "40000", 0));
+		ER(fsconfig(fs_fd, FSCONFIG_SET_STRING, "user_id", "0", 0));
+		ER(fsconfig(fs_fd, FSCONFIG_SET_STRING, "group_id", "0", 0));
 	}
-	ER(fsconfig(fs_fd, FSCONFIG_SET_STRING, "rootmode", "40000", 0));
-	ER(fsconfig(fs_fd, FSCONFIG_SET_STRING, "user_id", "0", 0));
-	ER(fsconfig(fs_fd, FSCONFIG_SET_STRING, "group_id", "0", 0));
+
 	ER(fsconfig(fs_fd, FSCONFIG_CMD_CREATE, 0, 0, 0));
 	mnt_fd = ER(fsmount(fs_fd, 0, 0));
 	ER(move_mount(mnt_fd, "", AT_FDCWD, lo->c.mnt, MOVE_MOUNT_F_EMPTY_PATH));
@@ -1208,6 +1334,10 @@ int main(int argc, char *argv[])
 			case 't':
 				c.nothread = 1;
 				break;
+
+			case 'x':
+				c.fusex = 1;
+				break;
 #endif
 			default:
 				lo_usage(argv);
@@ -1234,7 +1364,7 @@ int main(int argc, char *argv[])
 	lo->root.next = lo->root.prev = &lo->root;
 	lo->root.refcount = 2;
 
-	lo->root.fd = ER(open(lo->c.source, O_PATH));
+	lo->root.fd = ER(open(lo->c.source, O_RDONLY));
 
 	ER(statx(lo->root.fd, "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &stat));
 

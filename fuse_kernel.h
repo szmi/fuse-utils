@@ -239,6 +239,7 @@
  *  7.45
  *  - add FUSE_COPY_FILE_RANGE_64
  *  - add struct fuse_copy_file_range_out
+ *  - add FUSE_NOTIFY_PRUNE
  */
 
 #ifndef _LINUX_FUSE_H
@@ -494,6 +495,7 @@ struct fuse_file_lock {
 #define FUSE_ALLOW_IDMAP	(1ULL << 40)
 #define FUSE_OVER_IO_URING	(1ULL << 41)
 #define FUSE_REQUEST_TIMEOUT	(1ULL << 42)
+#define FUSE_X			(1ULL << 43)
 
 /**
  * CUSE INIT request/reply flags
@@ -662,6 +664,11 @@ enum fuse_opcode {
 	FUSE_TMPFILE		= 51,
 	FUSE_STATX		= 52,
 	FUSE_COPY_FILE_RANGE_64	= 53,
+	FUSE_LOOKUP_ROOT	= 54,
+	FUSE_LOOKUPX		= 55,
+	FUSE_MKOBJX		= 56,
+	FUSE_SETSTATX		= 58,
+	FUSE_DELETE		= 59,
 
 	/* CUSE specific operations */
 	CUSE_INIT		= 4096,
@@ -680,7 +687,7 @@ enum fuse_notify_code {
 	FUSE_NOTIFY_DELETE = 6,
 	FUSE_NOTIFY_RESEND = 7,
 	FUSE_NOTIFY_INC_EPOCH = 8,
-	FUSE_NOTIFY_CODE_MAX,
+	FUSE_NOTIFY_PRUNE = 9,
 };
 
 /* The read buffer is required to be at least 8k, but may be much larger */
@@ -697,6 +704,20 @@ struct fuse_entry_out {
 	uint32_t	entry_valid_nsec;
 	uint32_t	attr_valid_nsec;
 	struct fuse_attr attr;
+};
+
+/*
+ * entryx flags
+ * FUSE_ENTRYX_NEGATIVE: file does not exist, can cache this result
+ */
+#define FUSE_ENTRYX_NEGATIVE	(1 << 0)
+
+struct fuse_entryx_out {
+	uint64_t	nodeid;
+	uint64_t	entry_valid;
+	uint32_t	entry_valid_nsec;
+	uint32_t	flags;
+	uint64_t	spare;
 };
 
 struct fuse_forget_in {
@@ -753,6 +774,17 @@ struct fuse_mknod_in {
 	uint32_t	padding;
 };
 
+enum fuse_mkobjx_flags {
+	FUSE_MKOBJX_TMPFILE = 1 << 0,
+};
+
+struct fuse_mkobjx_in {
+	struct fuse_statx stat;
+	uint32_t	namesize;
+	uint32_t	flags;
+	uint64_t	spare[7];
+};
+
 struct fuse_mkdir_in {
 	uint32_t	mode;
 	uint32_t	umask;
@@ -789,6 +821,13 @@ struct fuse_setattr_in {
 	uint32_t	uid;
 	uint32_t	gid;
 	uint32_t	unused5;
+};
+
+struct fuse_setstatx_in {
+	uint64_t	fh;
+	uint32_t	flags;
+	uint32_t	reserved;
+	struct fuse_statx stat;
 };
 
 struct fuse_open_in {
@@ -1117,6 +1156,12 @@ struct fuse_notify_retrieve_in {
 	uint32_t	dummy2;
 	uint64_t	dummy3;
 	uint64_t	dummy4;
+};
+
+struct fuse_notify_prune_out {
+	uint32_t	count;
+	uint32_t	padding;
+	uint64_t	spare;
 };
 
 struct fuse_backing_map {
