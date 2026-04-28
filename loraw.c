@@ -16,6 +16,7 @@
 #include <err.h>
 #include <inttypes.h>
 #include <sched.h>
+#include <poll.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -26,7 +27,8 @@
 #include <sys/sysinfo.h>
 #include <sys/sysmacros.h>
 #include <liburing.h>
-
+#include <sys/xattr.h>
+#include <sys/statvfs.h>
 
 /* returns -1 on error */
 #define ER(_expr) \
@@ -41,6 +43,19 @@
 #define NL(_expr) \
         ({ typeof(_expr) _ret = (_expr); if (_ret == NULL) { errx(1, #_expr " returned NULL"); } _ret; })
 
+struct lo_fd {
+	int fd;
+	bool close;
+};
+
+static void cleanup_fd(struct lo_fd *fd)
+{
+        if (fd->close && fd->fd >= 0)
+                close(fd->fd);
+}
+
+#define LO_FD(fd_) struct lo_fd __attribute__((cleanup(cleanup_fd))) fd_ = \
+	{ .fd = -1, .close = false }
 
 struct lo_inode {
 	struct lo_inode *next; /* protected by lo->mutex */
@@ -69,8 +84,10 @@ struct lo_config {
 	int single;
 	int bind;
 	int map;
+	unsigned int mount_flags;
 	uint64_t timeout;
 	const char *source;
+	const char *tag;
 	int nothread;
 	int direct;
 	int uring;
@@ -79,6 +96,7 @@ struct lo_config {
 	int passthrough;
 	int passthrough2;
 	int fusex;
+	int no_open;
 	const char *mnt;
 };
 
@@ -96,7 +114,7 @@ struct lo_data {
 	struct lo_config c;
 	struct lo_inode root;
 	int devfd;
-	int inited;
+	int mounted_fd;
 };
 
 struct lo_chan {
@@ -372,13 +390,50 @@ static void *lo_out_arg(struct lo_req *req)
 		return req->rr.iov[1].iov_base;
 }
 
-static bool lo_overflow(struct lo_req *req, size_t size)
+static size_t lo_out_len(struct lo_req *req)
 {
 	if (req->is_ch)
-		return size > req->ch.bufsize - sizeof(struct fuse_out_header);
+		return req->ch.bufsize - sizeof(struct fuse_out_header);
 	else
-		return size > req->rr.iov[1].iov_len;
+		return req->rr.iov[1].iov_len;
 }
+
+static bool lo_overflow(struct lo_req *req, size_t size)
+{
+	return size > lo_out_len(req);
+}
+
+static struct lo_fd lo_open_node2(struct lo_req *req, uint64_t nodeid, int flags)
+{
+	struct lo_inode *inode = lo_inode(req->lo, nodeid);
+	char buf[64];
+
+	if (flags == O_PATH)
+		return (struct lo_fd) { .fd = inode->fd, .close = false };
+
+	sprintf(buf, "/proc/self/fd/%i", inode->fd);
+	return (struct lo_fd) { .fd = open(buf, flags), .close = true };
+}
+
+static struct lo_fd lo_open_node(struct lo_req *req, const struct fuse_in_header *inh, int flags)
+{
+	return lo_open_node2(req, inh->nodeid, flags);
+}
+
+static struct lo_file *lo_file(uint64_t fh)
+{
+	return (void *) (uintptr_t) fh;
+}
+
+static struct lo_fd lo_open_io(struct lo_req *req, struct fuse_in_header *inh, uint64_t fh,
+			       int flags)
+{
+	if (req->lo->c.no_open)
+		return lo_open_node(req, inh, flags);
+
+	return (struct lo_fd) { .fd = lo_file(fh)->fd, .close = false };
+}
+
 
 static void lo_convert_stat(const struct statx *stat, struct fuse_attr *attr)
 {
@@ -401,29 +456,6 @@ static void lo_convert_stat(const struct statx *stat, struct fuse_attr *attr)
 	attr->ctimensec	= stat->stx_ctime.tv_nsec;
 }
 
-static void lo_statx(struct lo_req *req, const struct fuse_in_header *inh,
-		     const struct fuse_statx_in *inarg)
-{
-	struct lo_data *lo = req->lo;
-	struct lo_inode *inode = lo_inode(lo, inh->nodeid);
-	struct fuse_statx_out *outarg = lo_out_arg(req);
-	struct statx stat;
-	int err;
-
-	(void) inarg;
-
-	err = statx(inode->fd, "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &stat);
-	if (err) {
-		lo_reply(req, errno, 0);
-		return;
-	}
-	assert(sizeof(outarg->stat) == sizeof(stat));
-	memcpy(&outarg->stat, &stat, sizeof(stat));
-	outarg->attr_valid = req->lo->c.timeout;
-
-	lo_reply(req, 0, sizeof(*outarg));
-}
-
 static void lo_getattr(struct lo_req *req, struct fuse_in_header *inh,
 		       struct fuse_getattr_in *inarg)
 {
@@ -436,11 +468,287 @@ static void lo_getattr(struct lo_req *req, struct fuse_in_header *inh,
 	if (lo_debug(req))
 		fprintf(stderr, "lo_getattr(ino=%"PRIu64")\n", inh->nodeid);
 
+	memset(outarg, 0, sizeof(*outarg));
 	outarg->attr_valid = lo->c.timeout;
 	outarg->attr_valid_nsec = 0;
 	outarg->dummy = 0;
 	outarg->attr = inode->attr;
 	lo_reply(req, 0, sizeof(*outarg));
+}
+
+static int lo_set_time(int basefd, const char *name, const struct fuse_sx_time *time)
+{
+	char buf[32];
+	char path[64];
+	char xattr[32];
+
+	snprintf(path, sizeof(path), "/proc/self/fd/%d", basefd);
+	snprintf(buf, sizeof(buf), "%lld.%09d",
+		 (unsigned long long) time->tv_sec, time->tv_nsec);
+	snprintf(xattr, sizeof(xattr), "trusted.loraw.%s", name);
+	return setxattr(path, xattr, buf, strlen(buf), 0);
+}
+
+static int lo_get_time(int basefd, const char *name, struct statx_timestamp *time,
+		       struct statx *sx, unsigned int mask)
+{
+	char buf[32];
+	char path[64];
+	char xattr[32];
+	int err;
+	long long int sec;
+	unsigned int nsec;
+
+	snprintf(path, sizeof(path), "/proc/self/fd/%d", basefd);
+	snprintf(xattr, sizeof(xattr), "trusted.loraw.%s", name);
+	err = getxattr(path, xattr, buf, sizeof(buf) - 1);
+	if (err == -1 && errno != ENODATA)
+		return -1;
+
+	if (err == -1)
+		return 0;
+
+	buf[err] = '\0';
+	if (sscanf(buf, "%lld.%u", &sec, &nsec) == 2) {
+		time->tv_sec = sec;
+		time->tv_nsec = nsec;
+		sx->stx_mask |= mask;
+	} else {
+		errno = EIO;
+		return -1;
+	}
+
+	return 0;
+}
+
+static int lo_do_setstatx(int basefd, const struct fuse_statx *sx)
+{
+	int res;
+
+	if (sx->mask & STATX_SIZE) {
+		res = ftruncate(basefd, sx->size);
+		if (res == -1)
+			return -1;
+	}
+	if (sx->mask & (STATX_UID | STATX_GID)) {
+		uid_t uid = -1;
+		gid_t gid = -1;
+
+		if (sx->mask & STATX_UID)
+			uid = sx->uid;
+		if (sx->mask & STATX_GID)
+			gid = sx->gid;
+		res = fchownat(basefd, "", uid, gid, AT_EMPTY_PATH);
+		if (res == -1)
+			return -1;
+	}
+	if (sx->mask & STATX_MODE) {
+		res = fchmodat(basefd, "", sx->mode & 07777, AT_EMPTY_PATH);
+		if (res == -1)
+			return -1;
+	}
+	if (sx->mask & STATX_ATIME) {
+		res = lo_set_time(basefd, "atime", &sx->atime);
+		if (res == -1)
+			return -1;
+	}
+	if (sx->mask & STATX_BTIME) {
+		res = lo_set_time(basefd, "btime", &sx->btime);
+		if (res == -1)
+			return -1;
+	}
+	if (sx->mask & STATX_CTIME) {
+		res = lo_set_time(basefd, "ctime", &sx->ctime);
+		if (res == -1)
+			return -1;
+	}
+	if (sx->mask & STATX_MTIME) {
+		res = lo_set_time(basefd, "mtime", &sx->mtime);
+		if (res == -1)
+			return -1;
+	}
+	return 0;
+}
+
+static void lo_setstatx(struct lo_req *req, const struct fuse_in_header *inh,
+			const struct fuse_setstatx_in *inarg)
+{
+	LO_FD(base);
+	int res;
+	struct fuse_statx_out *outarg = lo_out_arg(req);
+
+	if (inarg->stat.mask & ~(STATX_SIZE | STATX_ATIME | STATX_MTIME | STATX_CTIME | STATX_UID | STATX_GID | STATX_MODE)) {
+		lo_reply(req, EINVAL, 0);
+		return;
+	}
+
+	base = lo_open_node(req, inh, (inarg->stat.mask & STATX_SIZE) ? O_WRONLY : O_PATH);
+	if (base.fd == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	res = lo_do_setstatx(base.fd, &inarg->stat);
+	if (res == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	memset(outarg, 0, sizeof(*outarg));
+	lo_reply(req, 0, sizeof(*outarg));
+}
+
+static int lo_do_statx(struct lo_req *req, int basefd, struct fuse_statx_out *outarg)
+{
+	int err;
+	struct statx stat;
+
+	err = statx(basefd, "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
+		    STATX_BASIC_STATS, &stat);
+	if (err == -1)
+		return -1;
+
+	err = lo_get_time(basefd, "atime", &stat.stx_atime, &stat, STATX_ATIME);
+	if (err == -1)
+		return -1;
+	err = lo_get_time(basefd, "btime", &stat.stx_btime, &stat, STATX_BTIME);
+	if (err == -1)
+		return -1;
+	err = lo_get_time(basefd, "ctime", &stat.stx_ctime, &stat, STATX_CTIME);
+	if (err == -1)
+		return -1;
+	err = lo_get_time(basefd, "mtime", &stat.stx_mtime, &stat, STATX_MTIME);
+	if (err == -1)
+		return -1;
+
+	assert(sizeof(outarg->stat) == sizeof(stat));
+	memcpy(&outarg->stat, &stat, sizeof(stat));
+	outarg->attr_valid = req->lo->c.timeout;
+	return 0;
+}
+
+static void lo_statx(struct lo_req *req, const struct fuse_in_header *inh,
+		     const struct fuse_statx_in *inarg)
+{
+	LO_FD(base);
+	int err;
+	struct fuse_statx_out *outarg = lo_out_arg(req);
+
+	(void) inarg;
+
+	base = lo_open_node(req, inh, O_PATH);
+	if (base.fd == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+	memset(outarg, 0, sizeof(*outarg));
+	err = lo_do_statx(req, base.fd, outarg);
+	if (err) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	lo_reply(req, 0, sizeof(*outarg));
+}
+
+static int filter_xattr(char *list, int size)
+{
+	int rem = size;
+
+	while (rem) {
+		int thislen = strlen(list);
+
+		assert(thislen < rem);
+		if (!strncmp(list, "trusted.loraw.", 14)) {
+			memmove(list, list + thislen + 1, rem - thislen - 1);
+			size -= thislen + 1;
+		} else {
+			list += thislen + 1;
+		}
+		rem -= thislen + 1;
+	}
+	return size;
+}
+
+static void lo_getxattr(struct lo_req *req, const struct fuse_in_header *inh,
+			const struct fuse_getxattr_in *inarg, const char *name)
+{
+	LO_FD(base);
+	int res;
+	char path[64];
+	void *value = lo_out_arg(req);
+
+	if (lo_overflow(req, inarg->size)) {
+		lo_reply(req, EOVERFLOW, 0);
+		return;
+	}
+
+	base = lo_open_node(req, inh, O_PATH);
+	if (base.fd == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	snprintf(path, sizeof(path), "/proc/self/fd/%d", base.fd);
+	if (name)
+		res = getxattr(path, name, value, inarg->size);
+	else {
+		res = listxattr(path, value, inarg->size);
+		if (res > 0)
+			res = filter_xattr(value, res);
+	}
+	if (res == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	lo_reply(req, 0, res);
+}
+
+static void lo_setxattr(struct lo_req *req, const struct fuse_in_header *inh,
+			const struct fuse_setxattr_in *inarg, const char *name)
+{
+	LO_FD(base);
+	int res;
+	char path[64];
+	const void *value = name + strlen(name) + 1;
+
+	base = lo_open_node(req, inh, O_PATH);
+	if (base.fd == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	snprintf(path, sizeof(path), "/proc/self/fd/%d", base.fd);
+	res = setxattr(path, name, value, inarg->size, inarg->flags);
+	if (res == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	lo_reply(req, 0, res);
+}
+
+static void lo_removexattr(struct lo_req *req, const struct fuse_in_header *inh, const char *name)
+{
+	LO_FD(base);
+	int res;
+	char path[64];
+
+	base = lo_open_node(req, inh, O_PATH);
+	if (base.fd == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	snprintf(path, sizeof(path), "/proc/self/fd/%d", base.fd);
+	res = removexattr(path, name);
+	if (res == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	lo_reply(req, 0, res);
 }
 
 static struct lo_inode *lo_find(struct lo_data *lo, struct statx *st)
@@ -465,6 +773,7 @@ static void lo_reply_entry(struct lo_req *req, struct lo_inode *inode)
 {
 	struct fuse_entryx_out *outarg = lo_out_arg(req);
 
+	memset(outarg, 0, sizeof(*outarg));
 	outarg->nodeid = (uintptr_t) inode;
 	lo_reply(req, 0, sizeof(*outarg));
 }
@@ -478,65 +787,70 @@ static void lo_lookup_root(struct lo_req *req, const struct fuse_in_header *inh)
 	lo_reply_entry(req, &lo->root);
 }
 
+static struct lo_inode *lo_new_inode(struct lo_data *lo, int fd, const struct statx *stat)
+{
+	struct lo_inode *prev, *next, *inode;
+
+	inode = lo_alloc_inode(lo);
+	if (!inode)
+		return NULL;
+
+	inode->refcount = 1;
+	inode->fd = fd;
+	inode->dev = makedev(stat->stx_dev_major, stat->stx_dev_minor);
+	lo_convert_stat(stat, &inode->attr);
+
+	lo_mutex_lock(lo);
+	prev = &lo->root;
+	next = prev->next;
+	next->prev = inode;
+	inode->next = next;
+	inode->prev = prev;
+	prev->next = inode;
+	lo_mutex_unlock(lo);
+
+	return inode;
+}
+
 static void lo_lookupx(struct lo_req *req, const struct fuse_in_header *inh, const char *name)
 {
 	struct lo_data *lo = req->lo;
 	struct lo_inode *inode, *parent = lo_inode(lo, inh->nodeid);
 	struct fuse_entryx_out *outarg = lo_out_arg(req);
 	struct statx stat;
-	int newfd, res;
+	int newfd;
 
 	if (lo_debug(req)) {
 		fprintf(stderr, " lo_lookupx(parent=%"PRIu64", name=%s)\n",
 			inh->nodeid, name);
 	}
 
+	outarg->entry_valid = lo->c.timeout;
 	newfd = openat(parent->fd, name, O_PATH | O_NOFOLLOW);
 	if (newfd == -1) {
-		lo_reply(req, errno, 0);
-		return;
-	}
-
-	outarg->entry_valid = lo->c.timeout;
-	res = statx(newfd, "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS,  &stat);
-	if (res == -1) {
 		if (errno != ENOENT) {
 			lo_reply(req, errno, 0);
-			close(newfd);
 			return;
 		}
+		memset(outarg, 0, sizeof(*outarg));
 		outarg->flags = FUSE_ENTRYX_NEGATIVE;
 		lo_reply(req, 0, sizeof(*outarg));
 		return;
 	}
+
+	ER(statx(newfd, "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS,  &stat));
 
 	inode = lo_find(lo, &stat);
 	if (inode) {
 		close(newfd);
 		newfd = -1;
 	} else {
-		struct lo_inode *prev, *next;
-
-		inode = lo_alloc_inode(lo);
+		inode = lo_new_inode(lo, newfd, &stat);
 		if (!inode) {
 			lo_reply(req, ENOMEM, 0);
 			close(newfd);
 			return;
 		}
-
-		inode->refcount = 1;
-		inode->fd = newfd;
-		inode->dev = makedev(stat.stx_dev_major, stat.stx_dev_minor);
-		lo_convert_stat(&stat, &inode->attr);
-
-		lo_mutex_lock(lo);
-		prev = &lo->root;
-		next = prev->next;
-		next->prev = inode;
-		inode->next = next;
-		inode->prev = prev;
-		prev->next = inode;
-		lo_mutex_unlock(lo);
 	}
 	lo_reply_entry(req, inode);
 }
@@ -595,14 +909,6 @@ static void lo_lookup(struct lo_req *req, struct fuse_in_header *inh,
 	outarg->attr_valid = lo->c.timeout;
 	outarg->attr = inode->attr;
 
-#if 0
-	/* FIXME: name gets overwritten with fuse_uring */
-	if (lo_debug(req)) {
-		fprintf(stderr, "  %"PRIu64"/%s -> %"PRIu64"\n",
-			inh->nodeid, name, outarg->nodeid);
-	}
-#endif
-
 	lo_reply(req, 0, sizeof(*outarg));
 	return;
 
@@ -611,6 +917,208 @@ out_err:
 	if (newfd != -1)
 		close(newfd);
 	lo_reply(req, saverr, 0);
+}
+
+static void lo_mkobjx(struct lo_req *req, const struct fuse_in_header *inh,
+		      const struct fuse_mkobjx_in *arg, const char *name)
+{
+	struct lo_data *lo = req->lo;
+	LO_FD(base);
+	struct lo_inode *inode;
+	int newfd, res;
+	struct statx st;
+	struct fuse_statx stat;
+	char proc_path[64];
+	int tmpfile_fd = -1;
+	int open_flags = O_PATH | O_NOFOLLOW;
+
+	base = lo_open_node(req, inh, O_PATH);
+	if (base.fd == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	if (S_ISDIR(arg->stat.mode)) {
+		res = mkdirat(base.fd, name, arg->stat.mode);
+	} else if (S_ISLNK(arg->stat.mode)) {
+		res = symlinkat(name + arg->namesize, base.fd, name);
+	} else if (arg->flags & FUSE_MKOBJX_TMPFILE) {
+		snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", base.fd);
+		res = tmpfile_fd = open(proc_path, O_TMPFILE | O_RDWR, arg->stat.mode);
+		if (res != -1) {
+			snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", tmpfile_fd);
+			name = proc_path;
+			open_flags = O_PATH;
+		}
+	} else {
+		res = mknodat(base.fd, name, arg->stat.mode,
+			      makedev(arg->stat.rdev_major, arg->stat.rdev_minor));
+	}
+	if (res == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	newfd = openat(base.fd, name, open_flags);
+	if (newfd == -1) {
+		lo_reply(req, errno, 0);
+		if (tmpfile_fd != -1)
+			close(tmpfile_fd);
+		return;
+	}
+	if (tmpfile_fd != -1)
+		close(tmpfile_fd);
+
+	stat = arg->stat;
+	stat.mask &= STATX_UID | STATX_GID | STATX_ATIME | STATX_MTIME | STATX_CTIME | STATX_BTIME | STATX_MODE;
+	if (S_ISLNK(stat.mode))
+		stat.mask &= ~STATX_MODE;
+	res = lo_do_setstatx(newfd, &stat);
+	if (res == -1) {
+		lo_reply(req, errno, 0);
+		close(newfd);
+		return;
+	}
+	ER(statx(newfd, "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS,  &st));
+	assert(!lo_find(lo, &st));
+	inode = lo_new_inode(lo, newfd, &st);
+	if (!inode) {
+		lo_reply(req, ENOMEM, 0);
+		close(newfd);
+		return;
+	}
+	lo_reply_entry(req, inode);
+#if 0
+	struct fuse_file_handle *handle;
+
+	handle = lo_lookup_handle(req, newfd);
+	if (handle) {
+		if (arg->flags & FUSE_MKOBJX_TMPFILE)
+			lo_save_unlinked(req, newfd, handle);
+		else
+			close(newfd);
+	}
+	lo_reply_handle(req, handle);
+#endif
+}
+
+static void lo_maybe_save_unlinked(struct lo_req *req, int fd)
+{
+	(void) req;
+#if 0
+	struct stat st;
+
+	ER(fstatat(fd, "", &st, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW));
+	if (st.st_nlink) {
+		close(fd);
+	} else {
+		struct fuse_file_handle *handle = lo_lookup_handle(req, fd);
+
+		if (!handle) {
+			lo_reply(req, errno, 0);
+			close(fd);
+			return;
+		}
+		lo_save_unlinked(req, fd, handle);
+	}
+#endif
+	close(fd);
+}
+
+static void lo_remove(struct lo_req *req, const struct fuse_in_header *inh, const char *name,
+		      bool isdir)
+{
+	LO_FD(base);
+	int res, fd;
+
+	base = lo_open_node(req, inh, O_PATH);
+	if (base.fd == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+	fd = openat(base.fd, name, O_PATH | O_NOFOLLOW);
+	if (fd == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+	res = unlinkat(base.fd, name, isdir ? AT_REMOVEDIR : 0);
+	if (res == -1) {
+		lo_reply(req, errno, 0);
+		close(fd);
+		return;
+	}
+	lo_maybe_save_unlinked(req, fd);
+
+	lo_reply(req, 0, 0);
+}
+
+static void lo_rename(struct lo_req *req, const struct fuse_in_header *inh,
+		      const struct fuse_rename2_in *arg, const char *oldname)
+{
+	const char *newname = oldname + strlen(oldname) + 1;
+	LO_FD(olddir);
+	LO_FD(newdir);
+	int fd, res;
+
+	olddir = lo_open_node(req, inh, O_PATH);
+	if (olddir.fd == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+	newdir = lo_open_node2(req, arg->newdir, O_PATH);
+	if (newdir.fd == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+	fd = openat(newdir.fd, newname, O_PATH | O_NOFOLLOW);
+	if (fd == -1 && errno != ENOENT) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+	res = renameat2(olddir.fd, oldname, newdir.fd, newname, arg->flags);
+	if (res == -1) {
+		lo_reply(req, errno, 0);
+		if (fd != -1)
+			close(fd);
+		return;
+	}
+	if (fd != -1)
+		lo_maybe_save_unlinked(req, fd);
+
+	lo_reply(req, 0, 0);
+}
+
+static void lo_link(struct lo_req *req, const struct fuse_in_header *inh,
+		    const struct fuse_link_in *arg, const char *newname)
+{
+	LO_FD(newdir);
+	LO_FD(old);
+	int res;
+	struct stat st;
+
+	newdir = lo_open_node(req, inh, O_PATH);
+	if (newdir.fd == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+	old = lo_open_node2(req, arg->oldnodeid, O_PATH);
+	if (old.fd == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+	ER(fstatat(old.fd, "", &st, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW));
+
+	res = linkat(old.fd, "", newdir.fd, newname, AT_EMPTY_PATH);
+	if (res == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+#if 0
+	if (!st.st_nlink)
+		lo_delete_handle(req->lo, req->h2, arg->oldnodeid);
+#endif
+
+	lo_reply(req, 0, 0);
 }
 
 static int lo_backing_open(struct lo_data *lo, int fd)
@@ -682,11 +1190,6 @@ static void lo_open(struct lo_req *req, struct fuse_in_header *inh,
 	lo_reply(req, 0, sizeof(*outarg));
 }
 
-static struct lo_file *lo_file(uint64_t fh)
-{
-	return (void *) (uintptr_t) fh;
-}
-
 static void lo_release(struct lo_req *req, struct fuse_in_header *inh,
 		       struct fuse_release_in *inarg)
 {
@@ -709,23 +1212,126 @@ static void lo_read(struct lo_req *req, struct fuse_in_header *inh,
 		    struct fuse_read_in *inarg)
 {
 	char *outarg = lo_out_arg(req);
-	struct lo_file *lf = lo_file(inarg->fh);
 	ssize_t res;
-
-	(void) inh;
+	LO_FD(io);
 
 	if (lo_overflow(req, inarg->size)) {
 		lo_reply(req, EOVERFLOW, 0);
 		return;
 	}
 
-	res = pread(lf->fd, outarg, inarg->size, inarg->offset);
+	io = lo_open_io(req, inh, inarg->fh, O_RDONLY);
+	if (io.fd == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	res = pread(io.fd , outarg, inarg->size, inarg->offset);
 	if (res == -1) {
 		lo_reply(req, errno, 0);
 		return;
 	}
 
 	lo_reply(req, 0, res);
+}
+
+static void lo_write(struct lo_req *req, struct fuse_in_header *inh,
+		     struct fuse_write_in *inarg, void *data)
+{
+	struct fuse_write_out *outarg = lo_out_arg(req);
+	ssize_t res;
+	LO_FD(io);
+
+	io = lo_open_io(req, inh, inarg->fh, O_WRONLY);
+	if (io.fd == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	res = pwrite(io.fd, data, inarg->size, inarg->offset);
+	if (res == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	memset(outarg, 0, sizeof(*outarg));
+	outarg->size = res;
+	lo_reply(req, 0, sizeof(*outarg));
+}
+
+static void lo_fallocate(struct lo_req *req, struct fuse_in_header *inh,
+			 struct fuse_fallocate_in *inarg)
+{
+	LO_FD(io);
+	int res;
+
+	io = lo_open_io(req, inh, inarg->fh, O_WRONLY);
+	if (io.fd == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	res = fallocate(io.fd, inarg->mode, inarg->offset, inarg->length);
+	if (res == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	lo_reply(req, 0, 0);
+}
+
+static void lo_readlink(struct lo_req *req, struct fuse_in_header *inh)
+{
+	char *outarg = lo_out_arg(req);
+	size_t outlen = lo_out_len(req);
+	ssize_t res;
+	LO_FD(base);
+
+	base = lo_open_node(req, inh, O_PATH);
+	if (base.fd == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	res = readlinkat(base.fd, "", outarg, outlen);
+	if (res == -1)
+		lo_reply(req, errno, 0);
+	else if ((size_t) res == outlen)
+		lo_reply(req, ENAMETOOLONG, 0);
+	else
+		lo_reply(req, 0, res);
+}
+
+static void lo_statfs(struct lo_req *req, struct fuse_in_header *inh)
+{
+	struct fuse_statfs_out *outarg = lo_out_arg(req);
+	LO_FD(base);
+	int res;
+	struct statvfs buf;
+
+	base = lo_open_node(req, inh, O_PATH);
+	if (base.fd == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	res = fstatvfs(base.fd, &buf);
+	if (res == -1) {
+		lo_reply(req, errno, 0);
+		return;
+	}
+
+	memset(outarg, 0, sizeof(*outarg));
+	outarg->st.bsize	= buf.f_bsize;
+	outarg->st.frsize	= buf.f_frsize;
+	outarg->st.blocks	= buf.f_blocks;
+	outarg->st.bfree	= buf.f_bfree;
+	outarg->st.bavail	= buf.f_bavail;
+	outarg->st.files	= buf.f_files;
+	outarg->st.ffree	= buf.f_ffree;
+	outarg->st.namelen	= buf.f_namemax;
+
+	lo_reply(req, 0, sizeof(*outarg));
 }
 
 static void lo_opendir(struct lo_req *req, struct fuse_in_header *inh,
@@ -941,10 +1547,26 @@ static void lo_init(struct lo_req *req, struct fuse_in_header *inh,
 	outarg->max_write = 131072;
 	outarg->max_pages = 32;
 
-	req->lo->inited = 1;
-
 	lo_reply(req, 0, sizeof(*outarg));
 }
+
+#define PAYLOAD_IS_ARG -999
+
+static const struct { int off; bool is_name; } lo_payload_desc[256] = {
+	[FUSE_LOOKUP]		= { PAYLOAD_IS_ARG, true },
+	[FUSE_LOOKUPX]		= { PAYLOAD_IS_ARG, true },
+	[FUSE_REMOVEXATTR]	= { PAYLOAD_IS_ARG, true },
+	[FUSE_UNLINK]		= { PAYLOAD_IS_ARG, true },
+	[FUSE_RMDIR]		= { PAYLOAD_IS_ARG, true },
+	[FUSE_GETXATTR]		= { sizeof(struct fuse_getxattr_in), true },
+	[FUSE_SETXATTR]		= { sizeof(struct fuse_setxattr_in), true },
+	[FUSE_MKNOD]		= { sizeof(struct fuse_mknod_in), true },
+	[FUSE_MKOBJX]		= { sizeof(struct fuse_mkobjx_in), true },
+	[FUSE_RENAME2]		= { sizeof(struct fuse_rename2_in), true },
+	[FUSE_LINK]		= { sizeof(struct fuse_link_in), true },
+	[FUSE_WRITE]		= { sizeof(struct fuse_write_in), false },
+	[FUSE_BATCH_FORGET]	= { sizeof(struct fuse_batch_forget_in), false },
+};
 
 static size_t lo_getreq(struct lo_chan *lc)
 {
@@ -959,17 +1581,34 @@ static size_t lo_getreq(struct lo_chan *lc)
 static void lo_process(struct lo_req *req, struct fuse_in_header *inh,
 		       void *arg, void *payload, size_t len, struct io_uring_cqe *cqe)
 {
+	assert(inh->opcode < sizeof(lo_payload_desc) / sizeof(lo_payload_desc[0]));
+
+	int off = lo_payload_desc[inh->opcode].off;
+	if (req->is_ch) {
+		assert(payload == NULL);
+		if (off) {
+			if (off == PAYLOAD_IS_ARG)
+				payload = arg;
+			else
+				payload = arg + off;
+		}
+	} else {
+		if (off)
+			assert(len > 0);
+		else
+			assert(len == 0);
+	}
 
 	if (lo_debug(req)) {
 		fprintf(stderr,
-			"%cunique: %"PRIu64", opcode: %i, nodeid: %"PRIu64", insize: %zu\n",
+			"%cunique: %"PRIu64", opcode: %i, nodeid: %16"PRIx64", insize: %zu, name: <%s>\n",
 			req->is_ch ? ' ' : cqe ? '.' : '*',
-			inh->unique, inh->opcode, inh->nodeid, len);
+			inh->unique, inh->opcode, inh->nodeid, len,
+			lo_payload_desc[inh->opcode].is_name ? (char *) payload : "NULL");
 	}
 
 	switch (inh->opcode) {
 	case FUSE_INIT:
-		assert(req->is_ch || !len);
 		lo_init(req, inh, arg);
 		break;
 
@@ -978,55 +1617,102 @@ static void lo_process(struct lo_req *req, struct fuse_in_header *inh,
 		break;
 
 	case FUSE_LOOKUPX:
-		lo_lookupx(req, inh, payload ? payload : arg);
+		lo_lookupx(req, inh, payload);
  		break;
 
 	case FUSE_LOOKUP:
-		lo_lookup(req, inh, payload ? payload : arg);
+		lo_lookup(req, inh, payload);
 		break;
 
 	case FUSE_STATX:
-		assert(req->is_ch || !len);
 		lo_statx(req, inh, arg);
 		break;
 
 	case FUSE_GETATTR:
-		assert(req->is_ch || !len);
 		lo_getattr(req, inh, arg);
 		break;
 
+	case FUSE_SETSTATX:
+		lo_setstatx(req, inh, arg);
+		break;
+
+	case FUSE_GETXATTR:
+		lo_getxattr(req, inh, arg, payload);
+		break;
+
+	case FUSE_LISTXATTR:
+		lo_getxattr(req, inh, arg, NULL);
+		break;
+
+	case FUSE_SETXATTR:
+		lo_setxattr(req, inh, arg, payload);
+		break;
+
+	case FUSE_REMOVEXATTR:
+		lo_removexattr(req, inh, payload);
+		break;
+
+	case FUSE_READLINK:
+		lo_readlink(req, inh);
+		break;
+
+	case FUSE_STATFS:
+		lo_statfs(req, inh);
+		break;
+
+	case FUSE_MKOBJX:
+		lo_mkobjx(req, inh, arg, payload);
+		break;
+
+	case FUSE_UNLINK:
+		lo_remove(req, inh, payload, false);
+		break;
+
+	case FUSE_RMDIR:
+		lo_remove(req, inh, payload, true);
+		break;
+
+	case FUSE_RENAME2:
+		lo_rename(req, inh, arg, payload);
+		break;
+
+	case FUSE_LINK:
+		lo_link(req, inh, arg, payload);
+		break;
+
 	case FUSE_OPEN:
-		assert(req->is_ch || !len);
 		lo_open(req, inh, arg);
 		break;
 
 	case FUSE_RELEASE:
-		assert(req->is_ch || !len);
 		lo_release(req, inh, arg);
 		break;
 
 	case FUSE_READ:
-		assert(req->is_ch || !len);
 		lo_read(req, inh, arg);
 		break;
 
+	case FUSE_WRITE:
+		lo_write(req, inh, arg, payload);
+		break;
+
+	case FUSE_FALLOCATE:
+		lo_fallocate(req, inh, arg);
+		break;
+
 	case FUSE_OPENDIR:
-		assert(req->is_ch || !len);
 		lo_opendir(req, inh, arg);
 		break;
 
 	case FUSE_RELEASEDIR:
-		assert(req->is_ch || !len);
 		lo_releasedir(req, inh, arg);
 		break;
 
 	case FUSE_READDIR:
-		assert(req->is_ch || !len);
 		lo_readdir(req, inh, arg);
 		break;
 
 	case FUSE_FORGET:
-		assert(req->is_ch || !len);
 		lo_forget(req->lo, inh, arg);
 		break;
 
@@ -1134,6 +1820,8 @@ static void lo_start_uring(struct lo_thread_data *ltd)
 	}
 }
 
+static void lo_start_threads(struct lo_data *lo);
+
 static void lo_loop(struct lo_data *lo, int fd)
 {
 	struct lo_req req = {
@@ -1151,31 +1839,22 @@ static void lo_loop(struct lo_data *lo, int fd)
 
 		len = lo_getreq(&req.ch);
 		lo_process(&req, inh, arg, NULL, len, NULL);
+
+		if (lo->mounted_fd != -1) {
+			struct pollfd fd = { .fd = lo->mounted_fd };
+
+			ER(poll(&fd, 1, 0));
+			if (fd.revents & POLLHUP) {
+				close(fd.fd);
+				lo->mounted_fd = -1;
+				if (!lo->c.single)
+					lo_start_threads(lo);
+			} else if (fd.revents != 0) {
+				err(1, "poll: revents: %i", fd.revents);
+			}
+		}
 	}
-
 }
-
-static void lo_process_init(struct lo_data *lo)
-{
-	struct lo_req req = {
-		.lo = lo,
-		.is_ch = 1,
-		.ch.fd = lo->devfd,
-	};
-	struct fuse_in_header *inh;
-	void *arg;
-	size_t len;
-
-	lo_alloc_bufs(&req.ch);
-
-	inh = req.ch.inbuf;
-	arg = inh + 1;
-	len = lo_getreq(&req.ch);
-	lo_process(&req, inh, arg, NULL, len, NULL);
-
-	assert(lo->inited);
-}
-
 static void lo_start_common(struct lo_thread_data *ltd)
 {
 	struct lo_data *lo = ltd->lo;
@@ -1260,6 +1939,8 @@ static void lo_mount(struct lo_data *lo)
 
 	if (lo->c.fusex) {
 		fs_fd = ER(fsopen("fusex", 0));
+		if (lo->c.tag)
+			ER(fsconfig(fs_fd, FSCONFIG_SET_STRING, "source", lo->c.tag, 0));
 		ER(fsconfig(fs_fd, FSCONFIG_SET_FD, "fd", NULL, lo->devfd));
 	} else {
 		fs_fd = ER(fsopen("fuse", 0));
@@ -1273,12 +1954,66 @@ static void lo_mount(struct lo_data *lo)
 		ER(fsconfig(fs_fd, FSCONFIG_SET_STRING, "user_id", "0", 0));
 		ER(fsconfig(fs_fd, FSCONFIG_SET_STRING, "group_id", "0", 0));
 	}
-
+	close(lo->devfd);
 	ER(fsconfig(fs_fd, FSCONFIG_CMD_CREATE, 0, 0, 0));
-	mnt_fd = ER(fsmount(fs_fd, 0, 0));
+	mnt_fd = ER(fsmount(fs_fd, 0, lo->c.mount_flags));
 	ER(move_mount(mnt_fd, "", AT_FDCWD, lo->c.mnt, MOVE_MOUNT_F_EMPTY_PATH));
 	close(mnt_fd);
 	close(fs_fd);
+	if (lo->mounted_fd != -1)
+		close(lo->mounted_fd);
+	_exit(0);
+}
+
+struct mount_flags {
+    const char *opt;
+    unsigned int set;
+    unsigned int clear ;
+};
+
+static const struct mount_flags mount_flags[] = {
+	{"rw",		0,			MOUNT_ATTR_RDONLY},
+	{"ro",		MOUNT_ATTR_RDONLY,	0},
+	{"suid",	0,			MOUNT_ATTR_NOSUID},
+	{"nosuid",	MOUNT_ATTR_NOSUID,	0},
+	{"dev",		0,			MOUNT_ATTR_NODEV},
+	{"nodev",	MOUNT_ATTR_NODEV,	0},
+	{"exec",	0,			MOUNT_ATTR_NOEXEC},
+	{"noexec",	MOUNT_ATTR_NOEXEC,	0},
+	{"diratime",	0, 			MOUNT_ATTR_NODIRATIME},
+	{"nodiratime",	MOUNT_ATTR_NODIRATIME,	0},
+	{"symfollow",	0,			MOUNT_ATTR_NOSYMFOLLOW},
+	{"nosymfollow",	MOUNT_ATTR_NOSYMFOLLOW,	0},
+	{"atime",	0,			MOUNT_ATTR__ATIME},
+	{"noatime",	MOUNT_ATTR_NOATIME,	MOUNT_ATTR__ATIME},
+	{"relatime",	MOUNT_ATTR_RELATIME,	MOUNT_ATTR__ATIME},
+	{"strictatime",	MOUNT_ATTR_STRICTATIME,	MOUNT_ATTR__ATIME},
+	{NULL,		0,		0}
+};
+
+static void lo_parse_opts(struct lo_config *c, char *opts)
+{
+	for (char *opt = strtok(opts, ","); opt; opt = strtok(NULL, ",")) {
+		const char *source_pfx = "source=";
+		size_t source_len = strlen(source_pfx);
+		bool found = false;
+
+		if (strncmp(opt, source_pfx, source_len) == 0) {
+			c->source = opt + source_len;
+			found = true;
+		} else {
+			for (const struct mount_flags *mf = mount_flags; mf->opt; mf++) {
+				if (strcmp(opt, mf->opt) == 0) {
+					c->mount_flags &= ~mf->clear;
+					c->mount_flags |= mf->set;
+					found = true;
+					break;
+				}
+			}
+		}
+		if (!found)
+			errx(1, "unknown mount option: %s", opt);
+	}
 }
 
 static void lo_usage(char *argv[])
@@ -1293,7 +2028,10 @@ int main(int argc, char *argv[])
 	char *devname = "/dev/fuse";
 	struct statx stat;
 	int ctr;
-	int delay_threads = 0;
+	bool background = false;
+	bool is_child;
+	int pip[2];
+	int tfds[3];
 
 	if (argc < 2)
 		lo_usage(argv);
@@ -1334,11 +2072,24 @@ int main(int argc, char *argv[])
 			case 't':
 				c.nothread = 1;
 				break;
-
+#endif
 			case 'x':
 				c.fusex = 1;
+				c.no_open = 1;
 				break;
-#endif
+
+			case 'o':
+				lo_parse_opts(&c, arg+2);
+				break;
+
+			case 'c':
+				c.tag = arg+2;
+ 				break;
+
+			case 'z':
+				background = true;
+				break;
+
 			default:
 				lo_usage(argv);
 			}
@@ -1372,21 +2123,47 @@ int main(int argc, char *argv[])
 
 	lo->devfd = ER(open(devname, O_RDWR));
 
-	if (!lo->c.single) {
-		if (!lo->c.uring &&
-		    ioctl(lo->devfd, FUSE_DEV_IOC_SYNC_INIT) == 0)
-			lo_start_threads(lo);
-		else
-			delay_threads = 1;
+	ER(ioctl(lo->devfd, FUSE_DEV_IOC_SYNC_INIT));
+
+	if (lo->c.uring) {
+		tfds[0] = ER(open("/dev/null", O_RDONLY, 0));
+		tfds[1] = ER(dup(tfds[0]));
+		tfds[2] = ER(dup(tfds[1]));
+		ER(pipe(pip));
+		close(tfds[0]);
+		close(tfds[1]);
+		close(tfds[2]);
+	} else {
+		lo->mounted_fd = -1;
 	}
 
-	lo_mount(lo);
+	is_child = !ER(fork());
+	if (background && is_child) {
+		int nullfd;
 
-	if (lo->c.uring)
-		lo_process_init(lo);
+		ER(setsid());
+		(void) chdir("/");
 
-	if (delay_threads)
-		lo_start_threads(lo);
+		nullfd = ER(open("/dev/null", O_RDWR, 0));
+		(void) dup2(nullfd, 0);
+		(void) dup2(nullfd, 1);
+		(void) dup2(nullfd, 2);
+		if (nullfd > 2)
+			close(nullfd);
+	}
+
+	if (background ^ is_child) {
+		if (lo->c.uring) {
+			close(pip[0]);
+			lo->mounted_fd = pip[1];
+		}
+		lo_mount(lo);
+	}
+	if (lo->c.uring) {
+		close(pip[1]);
+		lo->mounted_fd = pip[0];
+	} else if (!lo->c.single)
+ 		lo_start_threads(lo);
 
 	lo_loop(lo, lo->devfd);
 
