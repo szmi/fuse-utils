@@ -1,0 +1,29 @@
+#!/bin/bash
+
+if [ ! "$3" = "-o" ]; then
+	exit 1
+fi
+
+TAG="$1"
+TARGET="$2"
+OPTIONS="$4"
+
+case ",$OPTIONS," in
+    *,remount,*)
+	exec mmount -o `echo $OPTIONS | sed -e "s/source=[^,]*,//"` $TARGET
+	;;
+    *)
+	# Check if there's already a fusex mount with this tag
+	# Look for existing mounts with this tag as the device name
+	EXISTING_MOUNT=$(awk -v tag="$TAG" '$1 == tag {print $2; exit}' /proc/mounts)
+
+	if [ -n "$EXISTING_MOUNT" ]; then
+		# Bind mount the existing mount to the target
+		exec mount --bind "$EXISTING_MOUNT" "$TARGET"
+	else
+		# Create a new fusex mount
+		ulimit -n 131072
+		exec /root/loraw -x -z -c$TAG -o$OPTIONS $TARGET
+	fi
+        ;;
+esac
